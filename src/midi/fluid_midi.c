@@ -1563,86 +1563,130 @@ fluid_track_reset(fluid_track_t *track)
 }
 
 /*
- * fluid_track_send_events
+ * Send the next event of a track. The caller has already checked that the
+ * event is due.
  */
 static void
-fluid_track_send_events(fluid_track_t *track,
-                        fluid_synth_t *synth,
-                        fluid_player_t *player,
-                        unsigned int ticks,
-                        int seek_ticks
-                       )
+fluid_track_send_next_event(fluid_track_t *track,
+                            fluid_player_t *player,
+                            unsigned int ticks,
+                            int seeking
+                           )
 {
-    fluid_midi_event_t *event;
+    fluid_midi_event_t *event = track->cur;
+
+    if(event == NULL)
+    {
+        return;
+    }
+
+    track->ticks += event->dtime;
+
+    if(!player || event->type == MIDI_EOT)
+    {
+        /* don't send EOT events to the callback */
+    }
+    else if(seeking && track->ticks != ticks && (event->type == NOTE_ON || event->type == NOTE_OFF))
+    {
+        /* skip on/off messages */
+    }
+    else
+    {
+        if(player->playback_callback)
+        {
+            int *chan_is_playing = &player->channel_isplaying[event->channel % MAX_NUMBER_OF_CHANNELS];
+            player->playback_callback(player->playback_userdata, event);
+            if(event->type == NOTE_ON && event->param2 != 0 && !*chan_is_playing)
+            {
+                *chan_is_playing = TRUE;
+            }
+        }
+    }
+
+    if(event->type == MIDI_SET_TEMPO && player != NULL)
+    {
+        /* memorize the tempo change value coming from the MIDI file */
+        fluid_atomic_int_set(&player->miditempo, event->param1);
+        fluid_player_update_tempo(player);
+    }
+
+    fluid_track_next_event(track);
+}
+
+/*
+ * Send all due events in absolute tick order. Tracks in a format 1 file share
+ * one timeline, so processing one track at a time can reorder events that fall
+ * into the same render block. On equal ticks, keep the track order stable.
+ */
+static void
+fluid_player_send_events(fluid_player_t *player,
+                         unsigned int ticks,
+                         int seek_ticks
+                        )
+{
+    int i;
     int seeking = seek_ticks >= 0;
 
     if(seeking)
     {
         ticks = seek_ticks; /* update target ticks */
 
-        // the track ticks is beyond the current ticks,
-        // or if the track ticks is equal to the current ticks,
-        // we want to play all events from the beginning of that tick
-        if(track->ticks >= ticks)
+        for(i = 0; i < player->ntracks; i++)
         {
-            fluid_track_reset(track);    /* reset track if seeking backwards */
+            fluid_track_t *track = player->track[i];
+
+            if(track == NULL)
+            {
+                continue;
+            }
+
+            // the track ticks is beyond the current ticks,
+            // or if the track ticks is equal to the current ticks,
+            // we want to play all events from the beginning of that tick
+            if(track->ticks >= ticks)
+            {
+                fluid_track_reset(track);    /* reset track if seeking backwards */
+            }
         }
     }
 
     while(1)
     {
+        fluid_track_t *next_track = NULL;
+        unsigned int next_tick = 0;
 
-        event = track->cur;
-
-        if(event == NULL)
+        for(i = 0; i < player->ntracks; i++)
         {
-            return;
-        }
+            fluid_track_t *track = player->track[i];
+            fluid_midi_event_t *event;
+            unsigned int event_tick;
 
-        /*         printf("track=%02d\tticks=%05u\ttrack=%05u\tdtime=%05u\tnext=%05u\n", */
-        /*                track->num, */
-        /*                ticks, */
-        /*                track->ticks, */
-        /*                event->dtime, */
-        /*                track->ticks + event->dtime); */
-
-        if(track->ticks + event->dtime > ticks)
-        {
-            return;
-        }
-
-        track->ticks += event->dtime;
-
-        if(!player || event->type == MIDI_EOT)
-        {
-            /* don't send EOT events to the callback */
-        }
-        else if(seeking && track->ticks != ticks && (event->type == NOTE_ON || event->type == NOTE_OFF))
-        {
-            /* skip on/off messages */
-        }
-        else
-        {
-            if(player->playback_callback)
+            if(track == NULL || track->cur == NULL)
             {
-                int *chan_is_playing = &player->channel_isplaying[event->channel % MAX_NUMBER_OF_CHANNELS];
-                player->playback_callback(player->playback_userdata, event);
-                if(event->type == NOTE_ON && event->param2 != 0 && !*chan_is_playing)
-                {
-                    *chan_is_playing = TRUE;
-                }
+                continue;
+            }
+
+            event = track->cur;
+            event_tick = track->ticks + event->dtime;
+
+            if(event_tick > ticks)
+            {
+                continue;
+            }
+
+            if(next_track == NULL || event_tick < next_tick)
+            {
+                next_track = track;
+                next_tick = event_tick;
             }
         }
 
-        if(event->type == MIDI_SET_TEMPO && player != NULL)
+        if(next_track == NULL)
         {
-            /* memorize the tempo change value coming from the MIDI file */
-            fluid_atomic_int_set(&player->miditempo, event->param1);
-            fluid_player_update_tempo(player);
+            return;
         }
 
-        fluid_track_next_event(track);
-
+        fluid_track_send_next_event(next_track, player, ticks, seeking);
     }
 }
 
@@ -2206,10 +2250,11 @@ fluid_player_callback(void *data, unsigned int msec)
             }
         }
 
+        fluid_player_send_events(player, player->cur_ticks, seek_ticks);
+
         for(i = 0; i < player->ntracks; i++)
         {
-            fluid_track_send_events(player->track[i], synth, player, player->cur_ticks, seek_ticks);
-            if(!fluid_track_eot(player->track[i]))
+            if(player->track[i] != NULL && !fluid_track_eot(player->track[i]))
             {
                 status = FLUID_PLAYER_PLAYING;
             }
